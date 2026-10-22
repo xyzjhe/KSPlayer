@@ -23,6 +23,9 @@ open class KSOptions {
     /// Compressed audio/video packet budget, independent of bitrate and duration.
     /// One demuxed packet may exceed this limit; decoded frames have separate queues.
     public var maxBufferSize = 64 * 1024 * 1024
+    /// Retain up to 4 MiB of distant HTTP byte ranges for non-interleaved files.
+    /// Uses native FFmpeg transport; existing custom IO/media caching takes priority.
+    public var httpRangeCacheEnabled = false
     /// 是否开启秒开
     public var isSecondOpen = KSOptions.isSecondOpen
     /// 开启精确seek
@@ -139,6 +142,10 @@ open class KSOptions {
         // ts直播流需要加这个才能一直直播下去，不然播放一小段就会结束了。
         formatContextOptions["reconnect"] = 1
         formatContextOptions["reconnect_streamed"] = 1
+        // FFmpeg 8.1 compares an unsigned HTTP remainder with the transport's
+        // short-seek result. A negative unsupported result can drain gigabytes
+        // before reopening a Range. Keep the documented threshold positive.
+        formatContextOptions["short_seek_size"] = 32 * 1024
         // 这个是用来开启http的链接复用（keep-alive）。vlc默认是打开的，所以这边也默认打开。
         // 开启这个，百度网盘的视频链接无法播放
         // formatContextOptions["multiple_requests"] = 1
@@ -205,6 +212,11 @@ open class KSOptions {
             // At the byte budget, waiting for more seconds would deadlock
             // high-bitrate playback. Each track still needs renderable frames.
             if isPacketBufferFull { return true }
+            // A bounded decoder queue cannot accumulate more frames while
+            // playback is paused for buffering. Other tracks still gate below.
+            if capacity.frameMaxCount > 0, capacity.frameCount >= capacity.frameMaxCount {
+                return true
+            }
             if capacity.isEndOfFile {
                 return true
             }

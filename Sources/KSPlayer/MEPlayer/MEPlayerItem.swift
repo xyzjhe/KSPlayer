@@ -47,6 +47,7 @@ public final class MEPlayerItem: Sendable {
         deadlineExpired && result == AVError.exit.code ? -Int32(ETIMEDOUT) : result
     }
     private var formatCtx: UnsafeMutablePointer<AVFormatContext>?
+    private var httpRangeIO: UnsafeMutablePointer<AVIOContext>?
     private var outputFormatCtx: UnsafeMutablePointer<AVFormatContext>?
     private var outputPacket: UnsafeMutablePointer<AVPacket>?
     private var streamMapping = [Int: Int]()
@@ -223,8 +224,7 @@ extension MEPlayerItem {
             error = NSError(description: "FFmpeg ABI mismatch: rebuild with the matching FFmpegKit libraries.")
             return
         }
-        releaseCustomIO()
-        avformat_close_input(&self.formatCtx)
+        closeInput()
         formatCtx = avformat_alloc_context()
         guard let formatCtx else {
             error = NSError(errorCode: .formatCreate)
@@ -263,6 +263,34 @@ extension MEPlayerItem {
         } else {
             urlString = url.absoluteString
         }
+        if customIO == nil, options.httpRangeCacheEnabled,
+           ["http", "https"].contains(url.scheme?.lowercased() ?? "")
+        {
+            var source: UnsafeMutablePointer<AVIOContext>?
+            var ioOptions = options.formatContextOptions.avOptions
+            if options.networkConnectTimeout == nil { options.networkConnectTimeout = 10 }
+            if options.networkReadTimeout == nil { options.networkReadTimeout = 15 }
+            beginIO(timeout: options.networkConnectTimeout)
+            var result = finishIO(avio_open2(&source, urlString, AVIO_FLAG_READ, &interruptCB, &ioOptions))
+            av_dict_free(&ioOptions)
+            if result >= 0, let source {
+                result = ksplayer_http_range_cache_create(&httpRangeIO, source, &interruptCB)
+            }
+            if result == 0, let httpRangeIO {
+                formatCtx.pointee.pb = httpRangeIO
+                formatCtx.pointee.flags |= AVFMT_FLAG_CUSTOM_IO
+            } else {
+                // Ownership remains with us on failure. Unknown-size or
+                // non-seekable inputs retain the ordinary FFmpeg open path.
+                if source != nil { avio_closep(&source) }
+                if result != -Int32(ENOSYS) {
+                    av_dict_free(&avOptions)
+                    if !shouldInterruptIO { error = NSError(errorCode: .formatOpenInput, avErrorCode: result) }
+                    closeInput()
+                    return
+                }
+            }
+        }
         beginIO(timeout: options.networkConnectTimeout)
         var result = avformat_open_input(&self.formatCtx, urlString, nil, &avOptions)
         result = finishIO(result)
@@ -270,15 +298,13 @@ extension MEPlayerItem {
         guard !shouldInterruptIO else { return }
         if result == AVError.eof.code {
             state = .finished
-            releaseCustomIO()
-            avformat_close_input(&self.formatCtx)
+            closeInput()
             delegate?.sourceDidFinished(source: self)
             return
         }
         guard result == 0 else {
             error = .init(errorCode: .formatOpenInput, avErrorCode: result)
-            releaseCustomIO()
-            avformat_close_input(&self.formatCtx)
+            closeInput()
             return
         }
         options.openTime = CACurrentMediaTime()
@@ -298,8 +324,7 @@ extension MEPlayerItem {
         guard !shouldInterruptIO else { return }
         guard result == 0 else {
             error = .init(errorCode: .formatFindStreamInfo, avErrorCode: result)
-            releaseCustomIO()
-            avformat_close_input(&self.formatCtx)
+            closeInput()
             return
         }
         // FIXME: hack, ffplay maybe should not use avio_feof() to test for the end
@@ -575,7 +600,8 @@ extension MEPlayerItem {
                 let seekMax = increase < 0 ? timeStamp - increase - 2 : Int64.max
                 // can not seek to key frame
                 let seekStartTime = CACurrentMediaTime()
-                var result = avformat_seek_file(formatCtx, -1, seekMin, timeStamp, seekMax, seekFlags)
+                beginIO(timeout: options.networkReadTimeout)
+                var result = finishIO(avformat_seek_file(formatCtx, -1, seekMin, timeStamp, seekMax, seekFlags))
 //                var result = av_seek_frame(formatCtx, -1, timeStamp, seekFlags)
                 // When seeking before the beginning of the file, and seeking fails,
                 // try again without the backwards flag to make it seek to the
@@ -584,7 +610,8 @@ extension MEPlayerItem {
                     KSLog("seek to \(seekToTime) failed. seekFlags remove BACKWARD")
                     options.seekFlags &= ~AVSEEK_FLAG_BACKWARD
                     seekFlags &= ~AVSEEK_FLAG_BACKWARD
-                    result = avformat_seek_file(formatCtx, -1, seekMin, timeStamp, seekMax, seekFlags)
+                    beginIO(timeout: options.networkReadTimeout)
+                    result = finishIO(avformat_seek_file(formatCtx, -1, seekMin, timeStamp, seekMax, seekFlags))
                 }
                 KSLog("seek to \(seekToTime) spend Time: \(CACurrentMediaTime() - seekStartTime)")
                 if state == .closed {
@@ -751,6 +778,15 @@ extension MEPlayerItem {
         let value = Unmanaged<AbstractAVIOContext>.fromOpaque(opaque).takeRetainedValue()
         value.close()
     }
+
+    private func closeInput() {
+        // Native cache opaque is C state, not an AbstractAVIOContext object.
+        if httpRangeIO == nil { releaseCustomIO() }
+        avformat_close_input(&formatCtx)
+        // open_input may have cleared formatCtx on failure. Keep independent
+        // ownership until the demuxer has closed, including that failure path.
+        ksplayer_http_range_cache_free(&httpRangeIO)
+    }
 }
 
 // MARK: MediaPlayback
@@ -799,12 +835,11 @@ extension MEPlayerItem: MediaPlayback {
             self.allPlayerItemTracks.forEach { $0.shutdown() }
             KSLog("清空formatCtx")
             // 自定义的协议才会av_class为空
-            self.releaseCustomIO()
             // 不要自己来释放pb。不然第二次播放同一个url会出问题
 //            self.formatCtx?.pointee.pb = nil
             self.formatCtx?.pointee.interrupt_callback.opaque = nil
             self.formatCtx?.pointee.interrupt_callback.callback = nil
-            avformat_close_input(&self.formatCtx)
+            self.closeInput()
             avformat_close_input(&self.outputFormatCtx)
             self.duration = 0
             self.closeOperation = nil
