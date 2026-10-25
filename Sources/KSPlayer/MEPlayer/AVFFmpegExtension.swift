@@ -436,7 +436,7 @@ extension AVRational: Equatable {
     }
 }
 
-public struct AVError: Error, Equatable {
+public struct AVError: Error, Equatable, LocalizedError {
     public var code: Int32
     public var message: String
 
@@ -444,6 +444,8 @@ public struct AVError: Error, Equatable {
         self.code = code
         message = String(avErrorCode: code)
     }
+
+    public var errorDescription: String? { message }
 }
 
 public extension Dictionary where Key == String {

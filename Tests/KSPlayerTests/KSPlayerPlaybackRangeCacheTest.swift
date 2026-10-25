@@ -197,37 +197,40 @@ final class KSPlayerPlaybackRangeCacheTest: XCTestCase {
     func testFFmpegCacheProtocolWrapsHttpOnlyWithoutCustomIO() throws {
         let remote = try XCTUnwrap(URL(string: "https://fixture.invalid/video.mp4?token=1"))
         XCTAssertEqual(
-            MEPlayerItem.inputURLString(
+            MEPlayerItem.inputURLStrings(
                 for: remote,
                 playbackRangeCacheEnabled: true,
                 hasCustomIO: false
             ),
-            "cache:https://fixture.invalid/video.mp4?token=1"
+            [
+                "cache:https://fixture.invalid/video.mp4?token=1",
+                "https://fixture.invalid/video.mp4?token=1",
+            ]
         )
         XCTAssertEqual(
-            MEPlayerItem.inputURLString(
+            MEPlayerItem.inputURLStrings(
                 for: remote,
                 playbackRangeCacheEnabled: false,
                 hasCustomIO: false
             ),
-            remote.absoluteString
+            [remote.absoluteString]
         )
         XCTAssertEqual(
-            MEPlayerItem.inputURLString(
+            MEPlayerItem.inputURLStrings(
                 for: remote,
                 playbackRangeCacheEnabled: true,
                 hasCustomIO: true
             ),
-            remote.absoluteString
+            [remote.absoluteString]
         )
         let local = URL(fileURLWithPath: "/tmp/video.mp4")
         XCTAssertEqual(
-            MEPlayerItem.inputURLString(
+            MEPlayerItem.inputURLStrings(
                 for: local,
                 playbackRangeCacheEnabled: true,
                 hasCustomIO: false
             ),
-            local.path
+            [local.path]
         )
     }
 

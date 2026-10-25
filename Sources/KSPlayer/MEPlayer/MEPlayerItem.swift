@@ -27,18 +27,19 @@ public final class MEPlayerItem: Sendable {
         return ioCancelled || ioDeadline.map { CACurrentMediaTime() >= $0 } == true
     }
 
-    static func inputURLString(
+    static func inputURLStrings(
         for url: URL,
         playbackRangeCacheEnabled: Bool,
         hasCustomIO: Bool
-    ) -> String {
+    ) -> [String] {
+        let original = url.isFileURL ? url.path : url.absoluteString
         if playbackRangeCacheEnabled, !hasCustomIO,
            let scheme = url.scheme?.lowercased(),
            scheme == "http" || scheme == "https"
         {
-            return "cache:\(url.absoluteString)"
+            return ["cache:\(url.absoluteString)", original]
         }
-        return url.isFileURL ? url.path : url.absoluteString
+        return [original]
     }
 
     private func beginIO(timeout: TimeInterval?) {
@@ -239,11 +240,6 @@ extension MEPlayerItem {
         }
         releaseCustomIO()
         avformat_close_input(&self.formatCtx)
-        formatCtx = avformat_alloc_context()
-        guard let formatCtx else {
-            error = NSError(errorCode: .formatCreate)
-            return
-        }
         var interruptCB = AVIOInterruptCB()
         interruptCB.opaque = Unmanaged.passUnretained(self).toOpaque()
         interruptCB.callback = { ctx -> Int32 in
@@ -253,36 +249,62 @@ extension MEPlayerItem {
             let formatContext = Unmanaged<MEPlayerItem>.fromOpaque(ctx).takeUnretainedValue()
             return formatContext.shouldInterruptIO ? 1 : 0
         }
-        formatCtx.pointee.interrupt_callback = interruptCB
+        func allocateFormatContext() -> Bool {
+            self.formatCtx = avformat_alloc_context()
+            guard let formatCtx = self.formatCtx else { return false }
+            formatCtx.pointee.interrupt_callback = interruptCB
+            return true
+        }
+        guard allocateFormatContext() else {
+            error = NSError(errorCode: .formatCreate)
+            return
+        }
         // avformat_close_input这个函数会调用io_close2。但是自定义协议是不会调用io_close2这个函数
 //        formatCtx.pointee.io_close2 = { _, _ -> Int32 in
 //            0
 //        }
         setHttpProxy()
-        var avOptions = options.formatContextOptions.avOptions
         var customIO = options.process(url: url)
         if customIO == nil, options.mediaCacheEnabled {
             let cache = KSPlayerMediaCache.shared
             cache.maximumCapacity = options.mediaCacheMaximumCapacity
             customIO = cache.makeFFmpegIOContext(url: url, headers: options.mediaCacheHeaders)
         }
-        if let pb = customIO {
+        if let pb = customIO, let formatCtx = self.formatCtx {
             // 如果要自定义协议的话，那就用avio_alloc_context，对formatCtx.pointee.pb赋值
             formatCtx.pointee.pb = pb.getContext()
             formatCtx.pointee.flags |= AVFMT_FLAG_CUSTOM_IO
         }
-        let urlString = Self.inputURLString(
+        let urlStrings = Self.inputURLStrings(
             for: url,
             playbackRangeCacheEnabled: options.playbackRangeCacheEnabled,
             hasCustomIO: customIO != nil
         )
-        if urlString.hasPrefix("cache:") {
-            KSLog(level: .warning, "KSMEPlayer enabled FFmpeg playback cache protocol")
+        var result = AVError.unknown.code
+        for (index, urlString) in urlStrings.enumerated() {
+            if index > 0 {
+                avformat_close_input(&self.formatCtx)
+                guard allocateFormatContext() else {
+                    error = NSError(errorCode: .formatCreate)
+                    return
+                }
+            }
+            if urlString.hasPrefix("cache:") {
+                KSLog(level: .warning, "KSMEPlayer enabled FFmpeg playback cache protocol")
+            }
+            var avOptions = options.formatContextOptions.avOptions
+            beginIO(timeout: options.networkConnectTimeout)
+            result = avformat_open_input(&self.formatCtx, urlString, nil, &avOptions)
+            result = finishIO(result)
+            av_dict_free(&avOptions)
+            if result == 0 || shouldInterruptIO { break }
+            if index + 1 < urlStrings.count {
+                KSLog(
+                    level: .warning,
+                    "KSMEPlayer playback cache open failed (\(result): \(String(avErrorCode: result))); retrying original URL"
+                )
+            }
         }
-        beginIO(timeout: options.networkConnectTimeout)
-        var result = avformat_open_input(&self.formatCtx, urlString, nil, &avOptions)
-        result = finishIO(result)
-        av_dict_free(&avOptions)
         guard !shouldInterruptIO else { return }
         if result == AVError.eof.code {
             state = .finished
@@ -295,6 +317,10 @@ extension MEPlayerItem {
             error = .init(errorCode: .formatOpenInput, avErrorCode: result)
             releaseCustomIO()
             avformat_close_input(&self.formatCtx)
+            return
+        }
+        guard let formatCtx = self.formatCtx else {
+            error = NSError(errorCode: .formatCreate)
             return
         }
         options.openTime = CACurrentMediaTime()
