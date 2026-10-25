@@ -27,6 +27,20 @@ public final class MEPlayerItem: Sendable {
         return ioCancelled || ioDeadline.map { CACurrentMediaTime() >= $0 } == true
     }
 
+    static func inputURLString(
+        for url: URL,
+        playbackRangeCacheEnabled: Bool,
+        hasCustomIO: Bool
+    ) -> String {
+        if playbackRangeCacheEnabled, !hasCustomIO,
+           let scheme = url.scheme?.lowercased(),
+           scheme == "http" || scheme == "https"
+        {
+            return "cache:\(url.absoluteString)"
+        }
+        return url.isFileURL ? url.path : url.absoluteString
+    }
+
     private func beginIO(timeout: TimeInterval?) {
         ioLock.lock()
         ioDeadline = timeout.map { CACurrentMediaTime() + $0 }
@@ -247,16 +261,6 @@ extension MEPlayerItem {
         setHttpProxy()
         var avOptions = options.formatContextOptions.avOptions
         var customIO = options.process(url: url)
-        if customIO == nil, options.playbackRangeCacheEnabled {
-            let cache = KSPlayerPlaybackRangeCache(
-                url: url,
-                headers: options.mediaCacheHeaders,
-                blockSize: options.playbackRangeCacheBlockSize,
-                capacity: options.playbackRangeCacheCapacity,
-                shouldCancel: { [weak self] in self?.shouldInterruptIO ?? true }
-            )
-            customIO = cache.makeFFmpegIOContext()
-        }
         if customIO == nil, options.mediaCacheEnabled {
             let cache = KSPlayerMediaCache.shared
             cache.maximumCapacity = options.mediaCacheMaximumCapacity
@@ -267,11 +271,13 @@ extension MEPlayerItem {
             formatCtx.pointee.pb = pb.getContext()
             formatCtx.pointee.flags |= AVFMT_FLAG_CUSTOM_IO
         }
-        let urlString: String
-        if url.isFileURL {
-            urlString = url.path
-        } else {
-            urlString = url.absoluteString
+        let urlString = Self.inputURLString(
+            for: url,
+            playbackRangeCacheEnabled: options.playbackRangeCacheEnabled,
+            hasCustomIO: customIO != nil
+        )
+        if urlString.hasPrefix("cache:") {
+            KSLog(level: .warning, "KSMEPlayer enabled FFmpeg playback cache protocol")
         }
         beginIO(timeout: options.networkConnectTimeout)
         var result = avformat_open_input(&self.formatCtx, urlString, nil, &avOptions)

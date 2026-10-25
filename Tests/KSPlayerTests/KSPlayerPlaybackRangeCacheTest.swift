@@ -89,19 +89,6 @@ private final class KSPlayerPlaybackRangeFixtureURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
-private final class KSPlayerPlaybackRangeCancellationState: @unchecked Sendable {
-    private let lock = NSLock()
-    private var cancelled = false
-
-    func cancel() {
-        lock.withLock { cancelled = true }
-    }
-
-    func isCancelled() -> Bool {
-        lock.withLock { cancelled }
-    }
-}
-
 private final class KSPlayerPlaybackRangePreparationState: @unchecked Sendable {
     let completed = DispatchSemaphore(value: 0)
 
@@ -207,20 +194,41 @@ final class KSPlayerPlaybackRangeCacheTest: XCTestCase {
         XCTAssertEqual(data.count, 2)
     }
 
-    func testFFmpegIOContextReturnsShortReadThenEndOfFile() throws {
-        let context = try XCTUnwrap(makeCache().makeFFmpegIOContext())
-        let start = Int64(KSPlayerPlaybackRangeFixtureURLProtocol.totalLength - 2)
-        XCTAssertEqual(context.seek(offset: start, whence: 0), start)
-
-        var buffer = [UInt8](repeating: 0, count: 32 * 1024)
-        let finalRead = buffer.withUnsafeMutableBufferPointer {
-            context.read(buffer: $0.baseAddress, size: Int32($0.count))
-        }
-        let eofRead = buffer.withUnsafeMutableBufferPointer {
-            context.read(buffer: $0.baseAddress, size: Int32($0.count))
-        }
-        XCTAssertEqual(finalRead, 2)
-        XCTAssertEqual(eofRead, 0)
+    func testFFmpegCacheProtocolWrapsHttpOnlyWithoutCustomIO() throws {
+        let remote = try XCTUnwrap(URL(string: "https://fixture.invalid/video.mp4?token=1"))
+        XCTAssertEqual(
+            MEPlayerItem.inputURLString(
+                for: remote,
+                playbackRangeCacheEnabled: true,
+                hasCustomIO: false
+            ),
+            "cache:https://fixture.invalid/video.mp4?token=1"
+        )
+        XCTAssertEqual(
+            MEPlayerItem.inputURLString(
+                for: remote,
+                playbackRangeCacheEnabled: false,
+                hasCustomIO: false
+            ),
+            remote.absoluteString
+        )
+        XCTAssertEqual(
+            MEPlayerItem.inputURLString(
+                for: remote,
+                playbackRangeCacheEnabled: true,
+                hasCustomIO: true
+            ),
+            remote.absoluteString
+        )
+        let local = URL(fileURLWithPath: "/tmp/video.mp4")
+        XCTAssertEqual(
+            MEPlayerItem.inputURLString(
+                for: local,
+                playbackRangeCacheEnabled: true,
+                hasCustomIO: false
+            ),
+            local.path
+        )
     }
 
     func testCancelledCacheRejectsNewReads() {
@@ -232,14 +240,13 @@ final class KSPlayerPlaybackRangeCacheTest: XCTestCase {
         )
     }
 
-    func testExternalCancellationStopsBlockedProbe() {
+    func testCancellationStopsBlockedProbe() {
         let requestStarted = KSPlayerPlaybackRangeFixtureURLProtocol.lock.withLock {
             KSPlayerPlaybackRangeFixtureURLProtocol.stallsRequests = true
             return KSPlayerPlaybackRangeFixtureURLProtocol.requestStarted
         }
-        let cancellation = KSPlayerPlaybackRangeCancellationState()
         let preparation = KSPlayerPlaybackRangePreparationState()
-        let cache = makeCache(shouldCancel: { cancellation.isCancelled() })
+        let cache = makeCache()
         defer { cache.cancel() }
 
         DispatchQueue.global(qos: .utility).async {
@@ -250,7 +257,7 @@ final class KSPlayerPlaybackRangeCacheTest: XCTestCase {
             return
         }
 
-        cancellation.cancel()
+        cache.cancel()
         XCTAssertEqual(preparation.completed.wait(timeout: .now() + 1), .success)
         XCTAssertEqual(preparation.takeResult(), false)
     }
@@ -264,8 +271,7 @@ final class KSPlayerPlaybackRangeCacheTest: XCTestCase {
 
     private func makeCache(
         blockSize: Int64? = nil,
-        capacity: Int64? = nil,
-        shouldCancel: @escaping @Sendable () -> Bool = { false }
+        capacity: Int64? = nil
     ) -> KSPlayerPlaybackRangeCache {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [KSPlayerPlaybackRangeFixtureURLProtocol.self]
@@ -274,7 +280,6 @@ final class KSPlayerPlaybackRangeCacheTest: XCTestCase {
             headers: ["Cookie": "fixture=1"],
             blockSize: blockSize ?? self.blockSize,
             capacity: capacity ?? self.capacity,
-            shouldCancel: shouldCancel,
             session: URLSession(configuration: configuration)
         )
     }
