@@ -247,6 +247,16 @@ extension MEPlayerItem {
         setHttpProxy()
         var avOptions = options.formatContextOptions.avOptions
         var customIO = options.process(url: url)
+        if customIO == nil, options.playbackRangeCacheEnabled {
+            let cache = KSPlayerPlaybackRangeCache(
+                url: url,
+                headers: options.mediaCacheHeaders,
+                blockSize: options.playbackRangeCacheBlockSize,
+                capacity: options.playbackRangeCacheCapacity,
+                shouldCancel: { [weak self] in self?.shouldInterruptIO ?? true }
+            )
+            customIO = cache.makeFFmpegIOContext()
+        }
         if customIO == nil, options.mediaCacheEnabled {
             let cache = KSPlayerMediaCache.shared
             cache.maximumCapacity = options.mediaCacheMaximumCapacity

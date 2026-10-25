@@ -51,6 +51,12 @@ open class KSOptions {
     public var mediaCacheEnabled = KSOptions.isMediaCacheEnabled
     /// 磁盘媒体缓存的最大容量，默认 512 MiB。
     public var mediaCacheMaximumCapacity = KSOptions.mediaCacheMaximumCapacity
+    /// 播放会话级 Range 块缓存。仅在播放器显式开启时生效，退出播放即释放。
+    public var playbackRangeCacheEnabled = KSOptions.isPlaybackRangeCacheEnabled
+    /// Range 缓存块大小。4 MiB 与远端文件源的分块读取保持一致。
+    public var playbackRangeCacheBlockSize = KSOptions.playbackRangeCacheBlockSize
+    /// Range 缓存内存上限。LRU 淘汰保证长视频不会随播放持续增长。
+    public var playbackRangeCacheCapacity = KSOptions.playbackRangeCacheCapacity
     //  record stream
     public var outputURL: URL?
     public var avOptions = [String: Any]()
@@ -531,6 +537,10 @@ public extension KSOptions {
     static var isMediaCacheEnabled = false
     /// 点播媒体磁盘预缓存最大容量，默认 512 MiB。
     static var mediaCacheMaximumCapacity: Int64 = 512 * 1024 * 1024
+    /// 播放会话级 Range 块缓存默认关闭，由接入方按媒体类型显式开启。
+    static var isPlaybackRangeCacheEnabled = false
+    static var playbackRangeCacheBlockSize: Int64 = 4 * 1024 * 1024
+    static var playbackRangeCacheCapacity: Int64 = 32 * 1024 * 1024
     /// 日志级别
     static var logLevel = LogLevel.warning
     static var logger: LogHandler = OSLog(lable: "KSPlayer")

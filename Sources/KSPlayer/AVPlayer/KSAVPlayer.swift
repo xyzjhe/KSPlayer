@@ -81,6 +81,7 @@ public class KSAVPlayer {
     private var urlAsset: AVURLAsset
     private var sourceURL: URL
     private var cacheLoader: KSPlayerMediaCacheResourceLoader?
+    private var playbackRangeCacheLoader: KSPlayerPlaybackRangeCacheResourceLoader?
     private var mediaCachePrepareTask: Task<Void, Never>?
     private var shouldSeekTo = TimeInterval(0)
     private var seekCompletionGeneration = 0
@@ -513,7 +514,34 @@ extension KSAVPlayer: MediaPlayerProtocol {
     public func prepareToPlay() {
         KSLog("prepareToPlay \(self)")
         options.prepareTime = CACurrentMediaTime()
-        if options.mediaCacheEnabled {
+        if options.playbackRangeCacheEnabled {
+            mediaCachePrepareTask?.cancel()
+            let url = sourceURL
+            let headers = options.mediaCacheHeaders
+            let blockSize = options.playbackRangeCacheBlockSize
+            let capacity = options.playbackRangeCacheCapacity
+            mediaCachePrepareTask = Task { [weak self] in
+                guard let self else { return }
+                let cache = KSPlayerPlaybackRangeCache(
+                    url: url,
+                    headers: headers,
+                    blockSize: blockSize,
+                    capacity: capacity
+                )
+                let cachedAsset = await withTaskCancellationHandler(operation: {
+                    await cache.makeAVAsset()
+                }, onCancel: {
+                    cache.cancel()
+                })
+                guard !Task.isCancelled else { return }
+                self.playbackRangeCacheLoader = cachedAsset?.loader
+                self.urlAsset = cachedAsset?.asset ?? AVURLAsset(
+                    url: url,
+                    options: self.options.avOptions
+                )
+                self.prepare(asset: self.urlAsset)
+            }
+        } else if options.mediaCacheEnabled {
             mediaCachePrepareTask?.cancel()
             let url = sourceURL
             let headers = options.mediaCacheHeaders
@@ -563,6 +591,11 @@ extension KSAVPlayer: MediaPlayerProtocol {
         mediaCachePrepareTask?.cancel()
         mediaCachePrepareTask = nil
         urlAsset.cancelLoading()
+        if playbackRangeCacheLoader != nil {
+            playbackRangeCacheLoader?.cancel()
+            urlAsset.resourceLoader.setDelegate(nil, queue: nil)
+            playbackRangeCacheLoader = nil
+        }
         if cacheLoader != nil {
             urlAsset.resourceLoader.setDelegate(nil, queue: nil)
             cacheLoader = nil
