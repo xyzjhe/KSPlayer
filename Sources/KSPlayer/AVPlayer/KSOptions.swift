@@ -53,9 +53,9 @@ open class KSOptions {
     public var mediaCacheMaximumCapacity = KSOptions.mediaCacheMaximumCapacity
     /// 播放会话级远端读取缓存。仅在播放器显式开启时生效，退出播放即释放。
     public var playbackRangeCacheEnabled = KSOptions.isPlaybackRangeCacheEnabled
-    /// AVPlayer Range 缓存块大小。4 MiB 与远端文件源的分块读取保持一致。
+    /// 播放会话 Range 缓存块大小。4 MiB 与远端文件源的分块读取保持一致。
     public var playbackRangeCacheBlockSize = KSOptions.playbackRangeCacheBlockSize
-    /// AVPlayer Range 缓存内存上限。LRU 淘汰保证长视频不会随播放持续增长。
+    /// 播放会话 Range 缓存内存上限。LRU 淘汰保证长视频不会随播放持续增长。
     public var playbackRangeCacheCapacity = KSOptions.playbackRangeCacheCapacity
     //  record stream
     public var outputURL: URL?

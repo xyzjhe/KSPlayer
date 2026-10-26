@@ -265,6 +265,26 @@ extension MEPlayerItem {
 //        }
         setHttpProxy()
         var customIO = options.process(url: url)
+        if customIO == nil, options.playbackRangeCacheEnabled,
+           let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https"
+        {
+            let cache = KSPlayerPlaybackRangeCache(
+                url: url,
+                headers: options.mediaCacheHeaders,
+                blockSize: options.playbackRangeCacheBlockSize,
+                capacity: options.playbackRangeCacheCapacity,
+                shouldCancel: { [weak self] in self?.shouldInterruptIO ?? true }
+            )
+            customIO = cache.makeFFmpegIOContext()
+            if customIO != nil {
+                KSLog(
+                    level: .warning,
+                    "KSMEPlayer enabled playback range custom IO " +
+                        "(block=\(options.playbackRangeCacheBlockSize), " +
+                        "capacity=\(options.playbackRangeCacheCapacity))"
+                )
+            }
+        }
         if customIO == nil, options.mediaCacheEnabled {
             let cache = KSPlayerMediaCache.shared
             cache.maximumCapacity = options.mediaCacheMaximumCapacity

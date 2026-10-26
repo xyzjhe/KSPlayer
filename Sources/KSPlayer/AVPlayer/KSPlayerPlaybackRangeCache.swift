@@ -37,12 +37,15 @@ final class KSPlayerPlaybackRangeCache: @unchecked Sendable {
     private let url: URL
     private let headers: [String: String]
     private let session: URLSession
+    private let shouldCancel: @Sendable () -> Bool
     private let condition = NSCondition()
     private var blocks = [Int64: Block]()
     private var loadingBlocks = Set<Int64>()
     private var tasks = [URLSessionDataTask]()
     private var cachedBytesValue: Int64 = 0
     private var accessSequence: UInt64 = 0
+    private var hitCount: UInt64 = 0
+    private var missCount: UInt64 = 0
     private var preparing = false
     private var preparationResult: Bool?
     private var totalBytesValue: Int64?
@@ -53,12 +56,14 @@ final class KSPlayerPlaybackRangeCache: @unchecked Sendable {
          headers: [String: String],
          blockSize: Int64,
          capacity: Int64,
+         shouldCancel: @escaping @Sendable () -> Bool = { false },
          session: URLSession = .shared)
     {
         self.url = url
         self.headers = headers
         self.blockSize = max(1, blockSize)
         self.capacity = max(max(1, blockSize), capacity)
+        self.shouldCancel = shouldCancel
         self.session = session
     }
 
@@ -88,17 +93,22 @@ final class KSPlayerPlaybackRangeCache: @unchecked Sendable {
     }
 
     func prepareSync() -> Bool {
+        guard !shouldCancel() else { return false }
         condition.lock()
         while preparing, preparationResult == nil, !cancelled {
-            condition.wait()
+            if shouldCancel() {
+                condition.unlock()
+                return false
+            }
+            _ = condition.wait(until: Date().addingTimeInterval(0.05))
         }
-        guard !cancelled else {
+        guard !cancelled, !shouldCancel() else {
             condition.unlock()
             return false
         }
         if let preparationResult {
             condition.unlock()
-            return preparationResult
+            return preparationResult && !shouldCancel()
         }
         preparing = true
         condition.unlock()
@@ -121,8 +131,9 @@ final class KSPlayerPlaybackRangeCache: @unchecked Sendable {
             success = false
         }
 
+        let interrupted = shouldCancel()
         condition.lock()
-        let finalSuccess = success && !cancelled
+        let finalSuccess = success && !cancelled && !interrupted
         if finalSuccess {
             totalBytesValue = totalBytes
             mimeTypeValue = mimeType
@@ -167,6 +178,11 @@ final class KSPlayerPlaybackRangeCache: @unchecked Sendable {
         return output
     }
 
+    func makeFFmpegIOContext() -> KSPlayerPlaybackRangeCacheIOContext? {
+        guard prepareSync() else { return nil }
+        return KSPlayerPlaybackRangeCacheIOContext(cache: self)
+    }
+
     func makeAVAsset() async -> (asset: AVURLAsset, loader: KSPlayerPlaybackRangeCacheResourceLoader)? {
         guard await prepare() else { return nil }
         let loader = KSPlayerPlaybackRangeCacheResourceLoader(cache: self)
@@ -189,10 +205,18 @@ final class KSPlayerPlaybackRangeCache: @unchecked Sendable {
         }
         cancelled = true
         let activeTasks = tasks
+        let summary = (hits: hitCount, misses: missCount, bytes: cachedBytesValue)
         tasks.removeAll()
         condition.broadcast()
         condition.unlock()
         activeTasks.forEach { $0.cancel() }
+        if summary.hits > 0 || summary.misses > 0 {
+            KSLog(
+                level: .warning,
+                "Playback range cache closed " +
+                    "(hits=\(summary.hits), misses=\(summary.misses), resident=\(summary.bytes))"
+            )
+        }
     }
 
     private func loadBlock(start: Int64, totalBytes: Int64) throws -> Data {
@@ -207,17 +231,19 @@ final class KSPlayerPlaybackRangeCache: @unchecked Sendable {
             }
             if var block = blocks[start] {
                 accessSequence &+= 1
+                hitCount &+= 1
                 block.access = accessSequence
                 blocks[start] = block
                 condition.unlock()
                 return block.data
             }
             if loadingBlocks.contains(start) {
-                condition.wait()
+                _ = condition.wait(until: Date().addingTimeInterval(0.05))
                 condition.unlock()
                 continue
             }
             loadingBlocks.insert(start)
+            missCount &+= 1
             condition.unlock()
             break
         }
@@ -271,6 +297,7 @@ final class KSPlayerPlaybackRangeCache: @unchecked Sendable {
 
     private func request(range: KSPlayerMediaCacheRange) throws -> (data: Data, response: HTTPURLResponse) {
         guard range.length > 0 else { throw KSPlayerPlaybackRangeCacheError.invalidRangeResponse }
+        guard !cancellationRequested() else { throw KSPlayerPlaybackRangeCacheError.cancelled }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.httpShouldHandleCookies = false
@@ -323,6 +350,7 @@ final class KSPlayerPlaybackRangeCache: @unchecked Sendable {
     }
 
     private func cancellationRequested() -> Bool {
+        if shouldCancel() { return true }
         condition.lock()
         let value = cancelled
         condition.unlock()
@@ -461,6 +489,69 @@ final class KSPlayerPlaybackRangeCacheResourceLoader: NSObject, AVAssetResourceL
 
     private func removeCancellation(_ identifier: ObjectIdentifier) {
         lock.withLock { cancelledRequests.remove(identifier) }
+    }
+}
+
+final class KSPlayerPlaybackRangeCacheIOContext: AbstractAVIOContext, @unchecked Sendable {
+    private let cache: KSPlayerPlaybackRangeCache
+    private var position: Int64 = 0
+    private var closed = false
+
+    init(cache: KSPlayerPlaybackRangeCache) {
+        self.cache = cache
+        super.init()
+    }
+
+    override func close() {
+        guard !closed else { return }
+        closed = true
+        cache.cancel()
+    }
+
+    deinit {
+        close()
+    }
+
+    override func read(buffer: UnsafePointer<UInt8>?, size: Int32) -> Int32 {
+        guard !closed else { return AVError.eof.code }
+        guard let buffer, size > 0 else { return 0 }
+        do {
+            let data = try cache.readSync(
+                range: KSPlayerMediaCacheRange(
+                    start: position,
+                    end: position + Int64(size)
+                )
+            )
+            guard !data.isEmpty else { return AVError.eof.code }
+            data.copyBytes(to: UnsafeMutablePointer(mutating: buffer), count: data.count)
+            position += Int64(data.count)
+            return Int32(data.count)
+        } catch KSPlayerPlaybackRangeCacheError.cancelled {
+            return AVError.exit.code
+        } catch {
+            return AVError.external.code
+        }
+    }
+
+    override func seek(offset: Int64, whence: Int32) -> Int64 {
+        guard !closed else { return -1 }
+        switch whence & 0xFFFF {
+        case 0:
+            position = offset
+        case 1:
+            position += offset
+        case 2:
+            guard let total = cache.metadata?.totalBytes else { return -1 }
+            position = total + offset
+        default:
+            return -1
+        }
+        position = max(0, position)
+        return position
+    }
+
+    override func fileSize() -> Int64 {
+        cache.metadata?.totalBytes ?? -1
     }
 }
 

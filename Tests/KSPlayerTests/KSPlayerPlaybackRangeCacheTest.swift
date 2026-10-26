@@ -105,6 +105,35 @@ private final class KSPlayerPlaybackRangePreparationState: @unchecked Sendable {
     }
 }
 
+private final class KSPlayerPlaybackRangeCancellationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.withLock { cancelled = true }
+    }
+
+    func isCancelled() -> Bool {
+        lock.withLock { cancelled }
+    }
+}
+
+private final class KSPlayerPlaybackRangeReadState: @unchecked Sendable {
+    let completed = DispatchSemaphore(value: 0)
+
+    private let lock = NSLock()
+    private var result: Int32?
+
+    func finish(_ result: Int32) {
+        lock.withLock { self.result = result }
+        completed.signal()
+    }
+
+    func takeResult() -> Int32? {
+        lock.withLock { result }
+    }
+}
+
 final class KSPlayerPlaybackRangeCacheTest: XCTestCase {
     private let blockSize = Int64(4 * 1024 * 1024)
     private let capacity = Int64(32 * 1024 * 1024)
@@ -194,6 +223,81 @@ final class KSPlayerPlaybackRangeCacheTest: XCTestCase {
         XCTAssertEqual(data.count, 2)
     }
 
+    func testFFmpegIOContextReusesAlignedBlock() throws {
+        let context = try XCTUnwrap(makeCache().makeFFmpegIOContext())
+        defer { context.close() }
+        let firstOffset = Int64(18 * 1024 * 1024)
+        let secondOffset = firstOffset + 64 * 1024
+        var buffer = [UInt8](repeating: 0, count: 32 * 1024)
+
+        XCTAssertEqual(context.seek(offset: firstOffset, whence: 0), firstOffset)
+        XCTAssertEqual(
+            buffer.withUnsafeMutableBufferPointer {
+                context.read(buffer: $0.baseAddress, size: Int32($0.count))
+            },
+            Int32(buffer.count)
+        )
+        XCTAssertEqual(context.seek(offset: secondOffset, whence: 0), secondOffset)
+        XCTAssertEqual(
+            buffer.withUnsafeMutableBufferPointer {
+                context.read(buffer: $0.baseAddress, size: Int32($0.count))
+            },
+            Int32(buffer.count)
+        )
+
+        let requests = KSPlayerPlaybackRangeFixtureURLProtocol.lock.withLock {
+            KSPlayerPlaybackRangeFixtureURLProtocol.requestedRanges
+        }
+        XCTAssertEqual(requests, [0 ..< 256, 16 * 1024 * 1024 ..< 20 * 1024 * 1024])
+    }
+
+    func testFFmpegIOContextReturnsShortReadThenEndOfFile() throws {
+        let context = try XCTUnwrap(makeCache().makeFFmpegIOContext())
+        defer { context.close() }
+        let start = Int64(KSPlayerPlaybackRangeFixtureURLProtocol.totalLength - 2)
+        XCTAssertEqual(context.seek(offset: start, whence: 0), start)
+
+        var buffer = [UInt8](repeating: 0, count: 32 * 1024)
+        let finalRead = buffer.withUnsafeMutableBufferPointer {
+            context.read(buffer: $0.baseAddress, size: Int32($0.count))
+        }
+        let eofRead = buffer.withUnsafeMutableBufferPointer {
+            context.read(buffer: $0.baseAddress, size: Int32($0.count))
+        }
+        XCTAssertEqual(finalRead, 2)
+        XCTAssertEqual(eofRead, AVError.eof.code)
+    }
+
+    func testExternalInterruptStopsBlockedFFmpegRead() throws {
+        let interruption = KSPlayerPlaybackRangeCancellationState()
+        let cache = makeCache(shouldCancel: { interruption.isCancelled() })
+        let context = try XCTUnwrap(cache.makeFFmpegIOContext())
+        defer { context.close() }
+        let requestStarted = KSPlayerPlaybackRangeFixtureURLProtocol.lock.withLock {
+            KSPlayerPlaybackRangeFixtureURLProtocol.stallsRequests = true
+            return KSPlayerPlaybackRangeFixtureURLProtocol.requestStarted
+        }
+        let read = KSPlayerPlaybackRangeReadState()
+        XCTAssertEqual(context.seek(offset: 2 * blockSize, whence: 0), 2 * blockSize)
+
+        DispatchQueue.global(qos: .utility).async {
+            var buffer = [UInt8](repeating: 0, count: 32 * 1024)
+            read.finish(
+                buffer.withUnsafeMutableBufferPointer {
+                    context.read(buffer: $0.baseAddress, size: Int32($0.count))
+                }
+            )
+        }
+        guard requestStarted.wait(timeout: .now() + 1) == .success else {
+            XCTFail("The blocking fixture request did not start.")
+            return
+        }
+
+        interruption.cancel()
+        XCTAssertEqual(read.completed.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(read.takeResult(), AVError.exit.code)
+    }
+
     func testFFmpegCacheProtocolWrapsHttpOnlyWithoutCustomIO() throws {
         let remote = try XCTUnwrap(URL(string: "https://fixture.invalid/video.mp4?token=1"))
         XCTAssertEqual(
@@ -274,7 +378,8 @@ final class KSPlayerPlaybackRangeCacheTest: XCTestCase {
 
     private func makeCache(
         blockSize: Int64? = nil,
-        capacity: Int64? = nil
+        capacity: Int64? = nil,
+        shouldCancel: @escaping @Sendable () -> Bool = { false }
     ) -> KSPlayerPlaybackRangeCache {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [KSPlayerPlaybackRangeFixtureURLProtocol.self]
@@ -283,6 +388,7 @@ final class KSPlayerPlaybackRangeCacheTest: XCTestCase {
             headers: ["Cookie": "fixture=1"],
             blockSize: blockSize ?? self.blockSize,
             capacity: capacity ?? self.capacity,
+            shouldCancel: shouldCancel,
             session: URLSession(configuration: configuration)
         )
     }
